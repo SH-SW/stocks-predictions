@@ -1,0 +1,10 @@
+# core
+torch
+torchvision
+pandas
+matplotlib
+numpy
+scikit-learn
+
+# testing / dev
+pytest
