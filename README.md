@@ -89,23 +89,6 @@ Outputs:
 - Dropout with single LSTM layer: PyTorch applies dropout only between stacked layers; with `num_layers=1`, LSTM dropout is ignored.
 - Constant predictions: using MSE on tiny targets can lead to mean-predicting; Huber loss helps.
 
-## Upload to GitHub
-
-From the project root:
-
-```bash
-# Initialize and commit
-git init
-git add .
-git commit -m "Initialize LSTM stock prediction project"
-
-# Create a new repo on GitHub first, then add your remote
-# Replace <YOUR_USER> and <REPO_NAME>
-git remote add origin https://github.com/<YOUR_USER>/<REPO_NAME>.git
-
-git branch -M main
-git push -u origin main
-```
 
 ## Troubleshooting
 
