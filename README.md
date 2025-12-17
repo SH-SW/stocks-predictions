@@ -85,17 +85,7 @@ Outputs:
 
 ## Common Pitfalls
 
-- Data leakage: do not fit scalers on combined train+val+test (fixed in the advanced script).
+- Data leakage: do not fit scalers on combined train+val+test 
 - Dropout with single LSTM layer: PyTorch applies dropout only between stacked layers; with `num_layers=1`, LSTM dropout is ignored.
 - Constant predictions: using MSE on tiny targets can lead to mean-predicting; Huber loss helps.
 
-
-## Troubleshooting
-
-- If batch size causes OOM on GPU, reduce `batch_size` (e.g., 256 → 128 → 64).
-- If validation loss plateaus, try: increasing `sequence_length` (e.g., 60–90), lowering `learning_rate`, adding/adjusting indicators, and using `ReduceLROnPlateau` + early stopping (advanced script).
-- If plots do not display in headless environments, save figures instead of `plt.show()`.
-
-## License
-
-See `LICENSE`.
