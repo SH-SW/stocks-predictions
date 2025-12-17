@@ -1,215 +1,264 @@
+import os
+import datetime
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torchvision.transforms as transforms
-from torchvision.datasets import CIFAR10
-from torch.utils.data import DataLoader, Dataset, TensorDataset
-import os
-import pytest
-import pandas as pd
-import math
-import datetime
-import matplotlib.pyplot as plt
-import numpy as np
-import torch.nn.init as init
+from torch.utils.data import DataLoader, Dataset
 from sklearn.preprocessing import MinMaxScaler
 
-# auxiliary functions for data loading
-def df_to_X_y(df):
-  df_as_np = df.to_numpy()
-
-  X = df_as_np[:-1, :] # daily values (open, high, low and close)
-  Y = df_as_np[1:, -1] # the target is the closing price of the next day
-
-  return X.astype(np.float32), Y.astype(np.float32)
-
-
-def str_to_datetime(s): # used to convert the date into an index
-  split = s.split('-')
-  year, month, day = int(split[0]), int(split[1]), int(split[2])
-  return datetime.datetime(year=year, month=month, day=day)
-
+# -----------------------
+# Config / paths
+# -----------------------
 proj_root = os.path.dirname(os.path.abspath(__file__))
 data_path = os.path.join(proj_root, "data")
 results_path = os.path.join(proj_root, "results")
+csv_filename = "aapl.us.csv"  # adjust if different
 
+# -----------------------
+# Helpers
+# -----------------------
+def str_to_datetime(s):
+    y, m, d = map(int, s.split('-'))
+    return datetime.datetime(year=y, month=m, day=d)
 
-df = pd.read_csv(os.path.join(data_path, "aapl.us.csv")) # use data following the same structure as this csv
+def df_to_X_y(df):
+    arr = df.to_numpy()
+    X = arr[:-1, -1:]         # only Close column (last column) -> shape (n, 1)
+    # Predict price change (percentage return) instead of absolute price
+    Y = arr[1:, -1] - arr[:-1, -1]  # scaled price difference
+    return X.astype(np.float32), Y.astype(np.float32)
 
+# -----------------------
+# Load & preprocess
+# -----------------------
+df = pd.read_csv(os.path.join(data_path, csv_filename))
 df['Date'] = df['Date'].apply(str_to_datetime)
 df = df[['Date', 'Open', 'High', 'Low', 'Close']]
 df.index = df.pop('Date')
-scaler = MinMaxScaler(feature_range=(-1, 1))
-df['Close'] = scaler.fit_transform(df['Close'].values.reshape(-1,1))
 
-q_80 = int(len(df['Close']) * .75)
+# scale each numeric column and keep scalers for inverse transforms
+scalers = {}
+for col in ['Open', 'High', 'Low', 'Close']:
+    sc = MinMaxScaler(feature_range=(-1, 1))
+    df[[col]] = sc.fit_transform(df[[col]])
+    scalers[col] = sc
 
-# split training and testing data
-train = df.iloc[:q_80, :]
-test = df.iloc[q_80:, :]
+# train / validation / test split (70% / 10% / 20%)
+train_idx = int(len(df) * 0.7)
+val_idx = int(len(df) * 0.8)
 
-# the dataset below are already np arrays
+train = df.iloc[:train_idx, :]
+val = df.iloc[train_idx:val_idx, :]
+test = df.iloc[val_idx:, :]
+
 X_train, y_train = df_to_X_y(train)
+X_val, y_val = df_to_X_y(val)
 X_test, y_test = df_to_X_y(test)
-y_train = y_train.reshape(-1,1)
-y_test = y_test.reshape(-1,1)
+y_train = y_train.reshape(-1, 1)
+y_val = y_val.reshape(-1, 1)
+y_test = y_test.reshape(-1, 1)
 
-plt.plot(train["Close"])
-plt.plot(test["Close"])
-plt.legend(['Train', 'Validation'])
+# plot scaled series (optional)
+plt.plot(train["Close"], label='train')
+plt.plot(val["Close"], label='validation')
+plt.plot(test["Close"], label='test')
+plt.legend()
+plt.title("Scaled Close (train vs validation vs test)")
+plt.show()
 
-dataset_train = np.hstack((X_train, y_train))
-dataset_test = np.hstack((X_test, y_test))
-len_train = len(dataset_train)
-len_test = len(dataset_test)
-len_seq = 50
+dataset_train_arr = np.hstack((X_train, y_train))
+dataset_val_arr = np.hstack((X_val, y_val))
+dataset_test_arr = np.hstack((X_test, y_test))
 
-"""
-structure of one element:
+SEQ_LEN = 60
 
-feature feature feature feature ignore
-feature feature feature feature ignore
-feature feature feature feature ignore
-feature feature feature feature target
-
-using sliding windows
-right most columns are the closing price of the next day
-the first for columns are the open, high, low and close of the current day
-"""
-
+# -----------------------
+# Dataset
+# -----------------------
 class MyDataset(Dataset):
     def __init__(self, data, window):
         self.data = data
         self.window = window
 
-    def __getitem__(self, index):
-        x = self.data[index:index + self.window, :-1]  # keeping all features except the last column
-        y = self.data[index+self.window, -1] # target from last element --> last column (target)
-        return x, y
-
     def __len__(self):
         return len(self.data) - self.window
 
-dataset_train = MyDataset(dataset_train, len_seq)
-dataset_test = MyDataset(dataset_test, len_seq)
+    def __getitem__(self, idx):
+        x = self.data[idx: idx + self.window, :-1]    # (window, features)
+        y = self.data[idx + self.window, -1]          # scalar target
+        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
 
-data_loader_train = DataLoader(dataset_train, batch_size=len_seq)
-data_loader_test = DataLoader(dataset_test, batch_size=1)
+train_dataset = MyDataset(dataset_train_arr, SEQ_LEN)
+val_dataset = MyDataset(dataset_val_arr, SEQ_LEN)
+test_dataset = MyDataset(dataset_test_arr, SEQ_LEN)
 
-class StockLN(nn.Module):
-    def __init__(self, input_dims, hidden_size, num_layers):
-        super(StockLN, self).__init__()
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
-        self.lstm = nn.LSTM(input_size=input_dims, hidden_size=hidden_size, num_layers=num_layers, dropout=0.3, batch_first=True)
-        self.fc1 = nn.Linear(hidden_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, 1) # for singlelabel the output must be 1
-        self.do = nn.Dropout(0.3)
-        self.relu = nn.ReLU()
+# -----------------------
+# Model
+# -----------------------
+class StockLSTM(nn.Module):
+    def __init__(self, input_dims, hidden_size=128, num_layers=1):
+        super().__init__()
+        # Single-layer, unidirectional LSTM for a true single-LSTM setup
+        self.lstm = nn.LSTM(input_size=input_dims, hidden_size=hidden_size,
+                            num_layers=num_layers, batch_first=True, bidirectional=False)
+        self.fc = nn.Linear(hidden_size, 1)
 
     def forward(self, x):
-        x, _ = self.lstm(x)
-        x = x[-1,-1,:]
-        x = self.fc1(x)
-        x = self.do(x)
-        x = self.fc2(x)
-        return x
-    
+        # x: (batch, seq_len, input_dims)
+        out, _ = self.lstm(x)           # out: (batch, seq_len, hidden)
+        out = out[:, -1, :]             # last timestep -> (batch, hidden)
+        out = self.fc(out)              # (batch, 1)
+        return out
 
-def train_test_model(model, criterion, optimizer, train_loader, test_loader, epochs, tolerance):
-
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+# -----------------------
+# Train / test utilities
+# -----------------------
+def train_test_model(model, criterion, optimizer, train_loader, val_loader, test_loader, epochs=200, tolerance=0.02, patience=30):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
+    loss_history = []
+    best_val_loss = float('inf')
+    patience_counter = 0
+    best_model_state = None
 
-    loss_list = []
-    for epoch in range(epochs):
+    for epoch in range(1, epochs+1):
+        # Training
         model.train()
-        total_step = len(train_loader)
-        for i, (features, labels) in enumerate(train_loader):
-            features = features.to(device)
-            labels = labels.to(device)
+        batch_losses = []
+        for features, labels in train_loader:
+            features = features.to(device)           # (batch, seq, feat)
+            labels = labels.to(device).float()       # (batch,)
+            outputs = model(features).squeeze(-1)    # (batch,)
 
-            # forward pass
-            outputs = model(features)
-            loss = criterion(outputs.squeeze(), labels[-1])
-
-            # backward and optimize
+            loss = criterion(outputs, labels)
             optimizer.zero_grad()
             loss.backward()
-            #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.7) # to avoid exploding gradient
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            loss_list.append(loss.item())
-            if (epoch % 15 == 0) and (i==total_step-1):
-                print ('Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}'
-                       .format(epoch+1, epochs, i+1, total_step, loss.item()))
+            batch_losses.append(loss.item())
 
-    # save the model checkpoint for transfer learning
-    if not os.path.exists(results_path):
-        os.makedirs(results_path)
-    torch.save(model.state_dict(), os.path.join(results_path, 'model.ckpt'))
+        loss_history.extend(batch_losses)
+        train_loss = np.mean(batch_losses)
+        
+        # Validation
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for features, labels in val_loader:
+                features = features.to(device)
+                labels = labels.to(device).float()
+                outputs = model(features).squeeze(-1)
+                loss = criterion(outputs, labels)
+                val_losses.append(loss.item())
+        
+        val_loss = np.mean(val_losses)
+        
+        if epoch % 25 == 0 or epoch == 1:
+            print(f"Epoch {epoch}/{epochs} - train loss: {train_loss:.6f}, val loss: {val_loss:.6f}")
+        
+        # Early stopping check
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            best_model_state = model.state_dict().copy()
+        else:
+            patience_counter += 1
+        
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch}. Best val loss: {best_val_loss:.6f}")
+            break
+    
+    # Load best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    
+    # save model
+    os.makedirs(results_path, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(results_path, "model.ckpt"))
 
-    # testing
+    # evaluate on test set
     model.eval()
+    correct = 0
+    total = 0
+    preds = []
+    trues = []
     with torch.no_grad():
-        correct = 0
-        total = 0
         for features, labels in test_loader:
             features = features.to(device)
-            labels = labels.to(device)
+            labels = labels.to(device).float()
+            outputs = model(features).squeeze(-1)   # (batch,)
+            within = torch.abs(outputs - labels) <= tolerance
+            correct += int(within.sum().item())
+            total += labels.numel()
 
-            # network predictions
-            outputs = model(features)
+            preds.extend(outputs.cpu().numpy().tolist())
+            trues.extend(labels.cpu().numpy().tolist())
 
-            within_tolerance = torch.abs(outputs.squeeze() - labels[-1]) <= tolerance
+    acc = 100.0 * correct / total if total > 0 else 0.0
+    print(f"Test accuracy (within tolerance={tolerance}): {acc:.2f}% ({correct}/{total})")
 
-            if within_tolerance == True:
-                correct+=1
+    # Convert scaled differences back to prices
+    # Get the base prices from test set
+    base_prices_scaled = test.iloc[SEQ_LEN:-1]['Close'].values  # base prices for reconstruction
+    base_prices_orig = scalers['Close'].inverse_transform(base_prices_scaled.reshape(-1,1)).flatten()
+    
+    # Convert scaled differences to original price scale and add to base
+    preds_scaled_prices = base_prices_scaled + np.array(preds)
+    trues_scaled_prices = base_prices_scaled + np.array(trues)
+    
+    preds_orig = scalers['Close'].inverse_transform(preds_scaled_prices.reshape(-1,1)).flatten() if preds else np.array([])
+    trues_orig = scalers['Close'].inverse_transform(trues_scaled_prices.reshape(-1,1)).flatten() if trues else np.array([])
 
-        total = len_test
-        test_accuracy = 100 * correct / total
-        print('Final test Accuracy of the model: {:.2f} %'.format(test_accuracy))
-
-
-    return loss_list
-
-def predict(model, train_loader, test_loader):
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-
-    model.eval()
-    with torch.no_grad():
-        total = 0
-        predictions = []
-        labels_plot = []
-
-        for features, labels in test_loader:
-            features = features.to(device)
-            labels = labels.to(device)
-            # network predictions
-            outputs = model(features)
-
-            predictions.append(outputs.squeeze().cpu().numpy())
-            labels_plot.append(labels[-1].cpu().numpy())
-
-    plt.figure(figsize=(10, 5))
-    plt.plot(predictions, label='Predictions', color='blue')
-    plt.plot(labels_plot, label='Actual Labels', color='orange')
-    plt.xlabel('Sample Index')
-    plt.ylabel('Value')
-    plt.title('Model Predictions vs Actual Labels')
+    plt.figure(figsize=(10,5))
+    plt.plot(preds_orig, label='Predictions (orig scale)')
+    plt.plot(trues_orig, label='Actual (orig scale)')
     plt.legend()
+    plt.title('Predictions vs Actual (original price scale)')
     plt.show()
 
-    return predictions
+    return loss_history
 
+def predict(model, loader):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    model.eval()
+    preds = []
+    trues = []
+    with torch.no_grad():
+        for features, labels in loader:
+            features = features.to(device)
+            outputs = model(features).squeeze(-1)
+            preds.extend(outputs.cpu().numpy().tolist())
+            trues.extend(labels.numpy().tolist())
 
+    # Convert scaled differences back to prices
+    base_prices_scaled = test.iloc[SEQ_LEN:-1]['Close'].values
+    
+    # Convert scaled differences to original price scale
+    preds_scaled_prices = base_prices_scaled + np.array(preds)
+    trues_scaled_prices = base_prices_scaled + np.array(trues)
+    
+    preds_orig = scalers['Close'].inverse_transform(preds_scaled_prices.reshape(-1,1)).flatten()
+    trues_orig = scalers['Close'].inverse_transform(trues_scaled_prices.reshape(-1,1)).flatten()
+    return preds, trues, preds_orig, trues_orig
 
-model = StockLN(input_dims=4, hidden_size=32, num_layers=1) 
-criterion = nn.MSELoss(reduction="mean") # mean squared error loss for regression task
-optimizer = optim.Adam(model.parameters(), lr=1e-3)
+# -----------------------
+# Run
+# -----------------------
+if __name__ == "__main__":
+    torch.manual_seed(42)
+    model = StockLSTM(input_dims=1, hidden_size=128, num_layers=1)  
+    criterion = nn.HuberLoss(delta=0.5)  # More robust to outliers than MSE
+    optimizer = optim.Adam(model.parameters(), lr=0.0005)
 
-
-loss_list = train_test_model(model, criterion, optimizer, data_loader_train, data_loader_test,epochs=500,tolerance=0.1)
-
-
-predictions = predict(model, data_loader_train ,data_loader_test)
+    loss_hist = train_test_model(model, criterion, optimizer, train_loader, val_loader, test_loader, epochs=200, tolerance=0.05, patience=30)
+    preds, trues, preds_orig, trues_orig = predict(model, test_loader)
+    
